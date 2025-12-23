@@ -3,22 +3,23 @@ experiment:
   device: cuda
   deterministic: false
   data:
-    train_path: ../src/data/trajectories/trajectories_m_3_n_3_LorenzSSM_data_T_100_N_1000_r2_-10.0dB_q2_0.0dB.pkl
-    test_path: ../src/data/trajectories/trajectories_m_3_n_3_LorenzSSM_data_T_2000_N_100_r2_-10.0dB_q2_0.0dB.pkl
-    long_test_path: ../src/data/trajectories/trajectories_m_3_n_3_LorenzSSM_data_T_2000_N_100_r2_-10.0dB_q2_0.0dB.pkl
+    train_path: data/trajectory/trajectory_w0_N300_T500_qc0.2_sigmar0.05.npz
+    test_path: data/trajectory/trajectory_w0_N300_T500_qc0.2_sigmar0.05.npz
+    long_test_path: ""
     split_path: ""
     splits_name: ""
-    batch_size: 64
-    num_workers: 4
-    pin_memory: true
+    batch_size: 128
+    num_workers: 0
+    pin_memory: false
     shuffle: true
-    window_length: 50
+    window_length: 500
     tr_to_test_split: 0.9
     tr_to_val_split: 0.8333
+    warm_fraction: 0.1
   model:
-    state_dim: 3
-    obs_dim: 3
-    dt: 0.02
+    state_dim: 4
+    obs_dim: 4
+    dt: 0.01
     dynamics_hidden: 128
     dynamics_depth: 3
     dynamics_use_gru: true
@@ -37,15 +38,16 @@ experiment:
     lr: 0.001
     betas: [0.9, 0.999]
     clip_norm: 1.0
-    amp: false
+    amp: true
     sigma0_scale: 1.0
-    use_warmup_q: false
+    use_warmup_q: true
     warmup_split: val
+    lambda_nis: 0.0
     lambda_delta: 0.0001
     lambda_L: 0.0001
   earlystop:
     patience: 15
-    min_delta: 0.0001
+    min_delta: 0.001
   logging:
     run_name: gru_augmented_ekf
     log_dir: runs/gru_augmented_ekf

@@ -1,14 +1,14 @@
-"""Covariance warm-start utilities."""
+"""Covariance warm-start utilities (innovation NLL grid search)."""
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Iterable, Tuple
 
 import torch
 from torch.utils.data import DataLoader
 
-from ..models.ekf import DifferentiableEKF
-from ..models.psd import PSDParameter, ScalarPSDParameter
-from ..utils.linear_algebra import safe_cholesky
+from models.gru_augmented_ekf.ekf import DifferentiableEKF
+from models.gru_augmented_ekf.psd import PSDParameter, ScalarPSDParameter
+from utils.linear_algebra import safe_cholesky
 
 
 def _softplus_inverse(y: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -60,51 +60,45 @@ def _prepare_mask(mask: torch.Tensor | None, shape: torch.Size, device: torch.de
     return mask.to(device=device)
 
 
+def _set_isotropic_q(ekf: DifferentiableEKF, q0: float, device: torch.device, jitter: float = 1e-6) -> torch.Tensor:
+    """Set ekf.q_param to an isotropic Q = q0^2 I."""
+    q_matrix = torch.eye(ekf.state_dim, device=device) * (q0**2)
+    return set_psd_parameter_from_matrix(ekf.q_param, q_matrix, jitter=jitter)
+
+
 @torch.no_grad()
-def _estimate_q(ekf: DifferentiableEKF, dataloader: DataLoader, device: torch.device, eps: float) -> torch.Tensor:
-    state_dim = ekf.state_dim
-    obs_dim = ekf.obs_dim
+def _innovation_nll_for_q(
+    ekf: DifferentiableEKF,
+    dataloader: DataLoader,
+    device: torch.device,
+    q0: float,
+    eps: float,
+) -> float:
+    """Compute mean innovation NLL for a candidate q0."""
+    _set_isotropic_q(ekf, q0, device=device, jitter=eps)
+    ekf.eval()
+    ekf.dynamics.eval()
 
-    sum_dy_outer = torch.zeros(obs_dim, obs_dim, device=device)
-    count_dy = torch.zeros(1, device=device)
-
-    sum_prop = torch.zeros(state_dim, state_dim, device=device)
-    count_prop = torch.zeros(1, device=device)
-
-    R = ekf.r_param.matrix().to(device)
+    total_nll = torch.zeros((), device=device)
+    total_count = torch.zeros((), device=device)
 
     for obs, mask in dataloader:
         obs = obs.to(device)
         mask_tensor = _prepare_mask(mask, obs.shape[:2], device)
         x0, Sigma0 = _initial_state(ekf.state_dim, obs.size(0), device)
-        outputs = ekf(obs, x0, Sigma0, mask=mask_tensor, return_jacobians=True)
+        outputs = ekf(obs, x0, Sigma0, mask=mask_tensor)
 
-        delta = outputs["innovations"]
-        valid = (~mask_tensor).unsqueeze(-1).unsqueeze(-1)
-        dy_outer = delta.unsqueeze(-1) * delta.unsqueeze(-2)
-        sum_dy_outer += (dy_outer * valid).sum(dim=(0, 1))
-        count_dy += valid.sum()
+        logdet_S = outputs["logdet_S"]  # (B, T)
+        whitened = outputs["whitened"]  # (B, T, obs_dim)
+        step_nll = whitened.pow(2).sum(dim=-1) + logdet_S
 
-        if outputs["Sigma_filt"].size(1) < 2:
-            continue
-        sigma_filt_prev = outputs["Sigma_filt"][:, :-1]
-        F_prev = outputs["F"][:, 1:]
-        valid_curr = (~mask_tensor[:, 1:]).unsqueeze(-1).unsqueeze(-1)
-        valid_prev = (~mask_tensor[:, :-1]).unsqueeze(-1).unsqueeze(-1)
-        transition_mask = valid_curr * valid_prev
-        propagated = torch.matmul(F_prev, torch.matmul(sigma_filt_prev, F_prev.transpose(-1, -2)))
-        sum_prop += (propagated * transition_mask).sum(dim=(0, 1))
-        count_prop += transition_mask.sum()
+        valid = ~mask_tensor
+        total_nll += (step_nll * valid).sum()
+        total_count += valid.sum()
 
-    if count_dy.item() <= 0 or count_prop.item() <= 0:
-        return torch.eye(state_dim, device=device)
-
-    S_hat = sum_dy_outer / count_dy
-    Sigma_hat = project_to_psd(S_hat - R, eps)
-    mean_prop = sum_prop / count_prop
-    Q_hat = project_to_psd(Sigma_hat - mean_prop, eps)
-    q0 = torch.clamp(torch.trace(Q_hat) / state_dim, min=eps)
-    return torch.eye(state_dim, device=device) * q0
+    if total_count.item() == 0:
+        return float("inf")
+    return float((total_nll / total_count).item())
 
 
 @torch.no_grad()
@@ -114,13 +108,23 @@ def covariance_matching_warm_start(
     device: torch.device,
     eps: float = 1e-6,
 ) -> float:
-    """Estimate an isotropic Q using a single warm-start pass."""
-    ekf.eval()
-    ekf.dynamics.eval()
-    q_matrix = _estimate_q(ekf, dataloader, device, eps)
-    q_matrix = set_psd_parameter_from_matrix(ekf.q_param, q_matrix)
-    tau_q = torch.logdet(q_matrix + eps * torch.eye(q_matrix.size(0), device=device))
-    return float(tau_q.item())
+    """Estimate an isotropic Q = q0^2 I via innovation NLL grid search."""
+    # Short log-spaced grid around typical small process noise scales.
+    grid: Iterable[float] = torch.logspace(-3, 0, steps=7).tolist()
+    best_q0, best_nll = None, float("inf")
+
+    for q0 in grid:
+        nll = _innovation_nll_for_q(ekf, dataloader, device, float(q0), eps)
+        if nll < best_nll:
+            best_nll = nll
+            best_q0 = float(q0)
+
+    if best_q0 is None:
+        return 0.0
+
+    q_matrix = _set_isotropic_q(ekf, best_q0, device=device, jitter=eps)
+    # Return the selected q0 (std) for logging.
+    return float(best_q0)
 
 
 __all__ = ["covariance_matching_warm_start", "set_psd_parameter_from_matrix", "project_to_psd"]

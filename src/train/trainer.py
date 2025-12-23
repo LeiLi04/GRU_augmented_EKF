@@ -5,22 +5,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 
+import numpy as np
 import torch
 from torch import nn, optim
 from torch.utils.tensorboard import SummaryWriter
 
-from ..config import ExperimentConfig
-from ..losses.innov_nll import innovation_nll
-from ..models.ekf import DifferentiableEKF, EKFConfig
-from ..models.measurement import LinearMeasurement, LinearMeasurementConfig
-from ..models.psd import PSDConfig, PSDParameter
-from ..models.residual_gru import DynamicsConfig, ResidualDynamics, build_residual_dynamics
-from ..metrics.nis_nees import compute_nis
-from ..utils.linear_algebra import safe_cholesky
-from ..utils.masking import masked_mean
-from ..data.lorenz import parse_noise_from_name
-from .warmstart_q0 import set_psd_parameter_from_matrix
-from ..utils.lorenz import lorenz_discrete_step, lorenz_discrete_jacobian
+from config import ExperimentConfig
+from losses.innov_nll import innovation_nll
+from models.gru_augmented_ekf.ekf import DifferentiableEKF, EKFConfig
+from models.gru_augmented_ekf.measurement import LinearMeasurement, LinearMeasurementConfig, RangeMeasurement
+from models.gru_augmented_ekf.psd import PSDConfig, PSDParameter
+from models.gru_augmented_ekf.residual_gru import DynamicsConfig, ResidualDynamics, build_residual_dynamics
+from metrics.nis_nees import compute_nis
+from utils.linear_algebra import safe_cholesky
+from utils.masking import masked_mean
+from train.warmstart_q0 import set_psd_parameter_from_matrix
 
 
 @dataclass
@@ -36,17 +35,17 @@ def build_model_components(
     train_path: Optional[Path] = None,
     obs_variance: Optional[torch.Tensor] = None,
 ) -> Tuple[ResidualDynamics, DifferentiableEKF, float, float]:
-    """Create dynamics, EKF, and initialise Q/R."""
-    q_from_name = parse_noise_from_name(train_path, "q2") if train_path else None
-    r_from_name = parse_noise_from_name(train_path, "r2") if train_path else None
-    q_diag_value = float(q_from_name if q_from_name is not None else cfg.model.q_init)
-    r_diag_value = float(r_from_name if r_from_name is not None else cfg.model.r_init)
+    """Create dynamics, EKF, and initialise Q/R for CV + range measurements."""
+    q_diag_value = float(cfg.model.q_init)
+    r_diag_value = float(cfg.model.r_init)
 
     dyn_cfg = DynamicsConfig(
         state_dim=cfg.model.state_dim,
         input_dim=cfg.model.state_dim + cfg.model.obs_dim,
         hidden_dim=cfg.model.dynamics_hidden,
         depth=cfg.model.dynamics_depth,
+        cov_rank=cfg.model.cov_rank,
+        cov_factor_scale=cfg.model.cov_factor_scale,
         use_gru=cfg.model.dynamics_use_gru,
         dt=cfg.model.dt,
         tanh_scale=cfg.model.dynamics_tanh_scale,
@@ -57,16 +56,52 @@ def build_model_components(
     )
 
     def f_known(x: torch.Tensor) -> torch.Tensor:
-        return lorenz_discrete_step(x, cfg.model.dt)
+        # Constant-velocity step: [px + vx*dt, py + vy*dt, vx, vy]
+        dt = cfg.model.dt
+        px, py, vx, vy = x[..., 0], x[..., 1], x[..., 2], x[..., 3]
+        out = torch.stack([px + vx * dt, py + vy * dt, vx, vy], dim=-1)
+        return out
+
+    def f_known_jac(_: torch.Tensor) -> torch.Tensor:
+        dt = cfg.model.dt
+        F = torch.tensor(
+            [
+                [1.0, 0.0, dt, 0.0],
+                [0.0, 1.0, 0.0, dt],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        return F.expand(1, -1, -1)
 
     dynamics = build_residual_dynamics(dyn_cfg, f_known=f_known, phys_derivative=None).to(device)
-    dynamics.f_known_jacobian = lambda x: lorenz_discrete_jacobian(x, cfg.model.dt)  # type: ignore[attr-defined]
+    dynamics.f_known_jacobian = lambda x: f_known_jac(x)  # type: ignore[attr-defined]
 
-    measurement = LinearMeasurement(LinearMeasurementConfig(cfg.model.state_dim, cfg.model.obs_dim)).to(device)
+    Q_base = None
+    if train_path:
+        payload = np.load(train_path, allow_pickle=True)
+        anchors_np = payload["anchors"]
+        Q_base = payload.get("Q", None)
+        anchors = torch.as_tensor(anchors_np, dtype=torch.float32, device=device)
+    else:
+        anchors = torch.tensor([[-1.5, 1.0, -1.0, 1.5], [0.5, 1.0, -1.0, -0.5]], device=device, dtype=torch.float32)
 
-    q_param = PSDParameter(PSDConfig(cfg.model.state_dim, init_scale=float(q_diag_value) ** 0.5)).to(device)
+    measurement = RangeMeasurement(anchors).to(device)
+
+    if Q_base is not None:
+        Q_base_t = torch.as_tensor(Q_base, dtype=torch.float32, device=device)
+        q_init_scale = float(torch.mean(torch.diagonal(Q_base_t))) ** 0.5
+    else:
+        q_init_scale = float(q_diag_value) ** 0.5
+
+    q_param = PSDParameter(PSDConfig(cfg.model.state_dim, init_scale=q_init_scale)).to(device)
     r_param = PSDParameter(PSDConfig(cfg.model.obs_dim, init_scale=float(r_diag_value) ** 0.5)).to(device)
-    q_matrix = torch.eye(cfg.model.state_dim, device=device) * q_diag_value
+    if Q_base is not None:
+        q_matrix = Q_base_t
+    else:
+        q_matrix = torch.eye(cfg.model.state_dim, device=device) * q_diag_value
     r_matrix = torch.eye(cfg.model.obs_dim, device=device) * r_diag_value
     set_psd_parameter_from_matrix(q_param, q_matrix, jitter=1e-6)
     set_psd_parameter_from_matrix(r_param, r_matrix, jitter=1e-5)
@@ -102,6 +137,19 @@ class Trainer:
         self.scaler = scaler if config.train.amp else None
         self.state = TrainerState()
 
+    def save(self, path: Path) -> None:
+        """Save dynamics and covariance parameters to a checkpoint."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "dynamics": self.dynamics.state_dict(),
+                "q_param": self.ekf.q_param.state_dict(),
+                "r_param": self.ekf.r_param.state_dict(),
+                "state": self.state,
+            },
+            path,
+        )
+
     def _initial_state(self, batch_size: int, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
         state_dim = self.config.model.state_dim
         x0 = torch.zeros(batch_size, state_dim, device=self.device, dtype=dtype)
@@ -117,8 +165,12 @@ class Trainer:
     def train_epoch(self, dataloader, writer: Optional[SummaryWriter] = None) -> dict[str, float]:
         self.ekf.train()
         self.dynamics.train()
-        metrics = {"L_innov": 0.0, "nis_mean": 0.0}
+        metrics = {"L_innov": 0.0, "nis_mean": 0.0, "reg_delta": 0.0, "reg_L": 0.0}
         updates = 0
+        lambda_nis = float(self.config.train.lambda_nis)
+        lambda_delta = float(self.config.train.lambda_delta)
+        lambda_L = float(self.config.train.lambda_L)
+        nis_target = float(self.config.model.obs_dim)
 
         iterator = iter(dataloader)
         for batch in iterator:
@@ -151,6 +203,29 @@ class Trainer:
                 loss = innovation_nll(delta_y, S, logdet_S, mask_chunk)
                 nis_vals, _ = compute_nis(delta_y, S, mask_chunk)
                 nis_mean = masked_mean(nis_vals.unsqueeze(-1), mask_chunk).mean()
+                if lambda_nis > 0.0:
+                    nis_penalty = (nis_mean - nis_target) ** 2
+                    loss = loss + lambda_nis * nis_penalty
+                if lambda_delta > 0.0 and "delta" in outputs:
+                    delta = outputs["delta"]
+                    if mask_chunk is not None:
+                        valid = (~mask_chunk).unsqueeze(-1).to(delta.dtype)
+                        denom = valid.sum().clamp(min=1.0)
+                        delta_reg = (delta.pow(2) * valid).sum() / denom
+                    else:
+                        delta_reg = delta.pow(2).mean()
+                    loss = loss + lambda_delta * delta_reg
+                    metrics["reg_delta"] += delta_reg.item()
+                if lambda_L > 0.0 and "u_t" in outputs:
+                    u_t_seq = outputs["u_t"]
+                    if mask_chunk is not None:
+                        valid_L = (~mask_chunk).unsqueeze(-1).unsqueeze(-1).to(u_t_seq.dtype)
+                        denom_L = valid_L.sum().clamp(min=1.0)
+                        L_reg = (u_t_seq.pow(2) * valid_L).sum() / denom_L
+                    else:
+                        L_reg = u_t_seq.pow(2).mean()
+                    loss = loss + lambda_L * L_reg
+                    metrics["reg_L"] += L_reg.item()
 
                 self.optimizer.zero_grad()
                 if self.scaler is not None:
@@ -206,6 +281,8 @@ def evaluate_nll(
     dynamics.eval()
     total = 0.0
     count = 0
+    lambda_nis = float(config.train.lambda_nis)
+    nis_target = float(config.model.obs_dim)
     with torch.no_grad():
         for obs, mask in dataloader:
             obs = obs.to(device)
@@ -220,6 +297,10 @@ def evaluate_nll(
             )
             outputs = ekf(obs, x0, Sigma0, mask=mask)
             val_loss = innovation_nll(outputs["innovations"], outputs["S"], outputs.get("logdet_S"), mask)
+            if lambda_nis > 0.0:
+                nis_vals, _ = compute_nis(outputs["innovations"], outputs["S"], mask)
+                nis_mean = masked_mean(nis_vals.unsqueeze(-1), mask).mean()
+                val_loss = val_loss + lambda_nis * (nis_mean - nis_target) ** 2
             total += val_loss.item() * batch_size
             count += batch_size
     ekf.train()

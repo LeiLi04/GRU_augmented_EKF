@@ -6,7 +6,7 @@ from typing import Optional, Tuple
 import torch
 from scipy.stats import chi2
 
-from ..utils.linear_algebra import safe_cholesky, chol_solve
+from utils.linear_algebra import safe_cholesky, chol_solve
 
 
 def _chi2_band(dim: int, alpha: float) -> Tuple[float, float]:

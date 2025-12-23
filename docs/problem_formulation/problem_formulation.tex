@@ -1,0 +1,438 @@
+\documentclass[a4paper,conference]{IEEEtran}
+% =====================================================================
+% IEEEtran Conference Paper (EUSIPCO-style)
+% Fixed sections:
+% Introduction; System Model; Proposed Approach; Experiments; Conclusion; References
+% Constraints (per user):
+% 1) Professor range equation appears ONLY in Experiments.
+% 2) System Model: only SSM + EKF.
+% 3) Proposed: GRU-augmented EKF (features, GRU, delta/alpha, augmented EKF),
+%    then Warm-start, then NLL (with brief derivation).
+% 4) Concrete scenario details (F, H, Q, R, anchors, etc.) ONLY in Experiments.
+% Notation: covariance is Sigma (NOT P).
+% =====================================================================
+
+% -------------------- Packages (keep minimal) --------------------
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{bm}
+\usepackage{mathtools}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{siunitx}
+\usepackage{url}
+\usepackage[caption=false,font=footnotesize]{subfig}
+
+% -------------------- Commands --------------------
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\tr}{\mathrm{tr}}
+\newcommand{\diag}{\operatorname{diag}}
+\newcommand{\T}{^{\mathsf T}}
+\newcommand{\inv}{^{-1}}
+
+% Disable draft comments if pasted
+\newcommand{\dd}[1]{}
+
+% -------------------- Title / Authors --------------------
+\title{Unsupervised GRU-Augmented EKF via Innovation Likelihood\\
+for Multi-Anchor Range-Only Target Tracking under Motion-Model Mismatch}
+
+\author{
+\IEEEauthorblockN{Lei Li, Coauthor Name}
+\IEEEauthorblockA{University of Bologna, Italy\\
+Email: lei.li@studio.unibo.it}
+}
+
+\begin{document}
+\maketitle
+
+% =====================================================================
+\begin{abstract}
+We study multi-anchor range-only target tracking in regimes where the motion model is imperfect and process-noise statistics are uncertain.
+We propose an unsupervised estimator that preserves the analytic EKF measurement update and augments the prediction step with a lightweight GRU.
+The GRU outputs a bounded residual correction to the prior mean and a constrained diagonal scaling of the prior covariance.
+Training uses unlabeled measurement sequences only and maximizes the one-step predictive likelihood, implemented as an innovation negative log-likelihood with Cholesky-stable linear algebra.
+We evaluate EKF, UKF, particle filtering, and the proposed GRU-augmented EKF on the Exercise~5.5 range-only scenario under matched and maneuver-mismatched motion.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Target tracking, range-only measurements, extended Kalman filter, innovation likelihood, unsupervised learning, GRU.
+\end{IEEEkeywords}
+
+% =====================================================================
+\section{Introduction}
+% =====================================================================
+Multi-anchor ranging is widely used for localization and tracking in indoor positioning, infrastructure-assisted navigation, and time-of-flight sensing.
+A standard solution combines a kinematic prior with a Kalman-type recursion.
+In practice, performance degrades when the motion prior is mismatched, or when process-noise statistics are unknown or time-varying, often yielding long-horizon drift and miscalibrated uncertainty.
+
+Model-based nonlinear filters such as the extended Kalman filter (EKF) and the unscented Kalman filter (UKF) can accommodate nonlinear measurements, but they still rely on a reasonably accurate transition model and well-tuned covariances.
+Particle filters (PFs) can handle stronger nonlinearities and non-Gaussian posteriors, but they increase computational cost and can suffer from weight degeneracy.
+Learning-based estimators can capture unmodeled dynamics, yet many require supervised state labels or replace the Bayesian update, reducing interpretability and transparency of uncertainty.
+
+We target a hybrid design that retains the analytic EKF measurement update and learns only prediction-side corrections from unlabeled measurements.
+Concretely, we augment the EKF prediction with a GRU that outputs a residual on the prior mean and a diagonal scaling on the prior covariance.
+The model is trained end-to-end by minimizing an innovation negative log-likelihood derived from the one-step predictive distribution.
+
+\textbf{Contributions.}
+\begin{itemize}
+\item A GRU-augmented EKF that preserves the closed-form EKF update while producing explicit covariance estimates.
+\item An unsupervised training objective based solely on innovation predictive likelihood, computed stably via Cholesky factorization.
+\item An experimental study on Exercise~5.5 range-only tracking, comparing EKF/UKF/PF and the proposed NLL-trained GRU-augmented EKF under motion-model mismatch.
+\end{itemize}
+
+% =====================================================================
+\section{System Model}
+% =====================================================================
+We consider a discrete-time nonlinear state-space model (SSM) with latent state
+$\bm{x}_k \in \R^{m}$ and measurement $\bm{y}_k \in \R^{n}$:
+\begin{subequations}\label{eq:ssm}
+\begin{align}
+\bm{x}_{k} &= f(\bm{x}_{k-1}) + \bm{w}_{k-1},
+\qquad \bm{w}_{k-1}\sim\mathcal{N}(\bm{0},\bm{Q}), \label{eq:ssm_x}\\
+\bm{y}_k &= h(\bm{x}_k) + \bm{v}_k,
+\qquad \bm{v}_k\sim\mathcal{N}(\bm{0},\bm{R}). \label{eq:ssm_y}
+\end{align}
+\end{subequations}
+Here $f(\cdot)$ and $h(\cdot)$ are (possibly nonlinear) transition and measurement functions.
+We use $\bm{\Sigma}_{k|k}$ and $\bm{\Sigma}_{k|k-1}$ to denote the posterior and prior error covariance, respectively.
+
+\subsection{Extended Kalman Filter (EKF)}
+Given $(\hat{\bm{x}}_{k-1|k-1},\bm{\Sigma}_{k-1|k-1})$, EKF linearizes $f$ and $h$
+using Jacobians
+\begin{equation}
+\bm{J}^f_{k-1} \triangleq
+\left.\frac{\partial f(\bm{x})}{\partial \bm{x}}\right|_{\bm{x}=\hat{\bm{x}}_{k-1|k-1}},
+\qquad
+\bm{J}^h_{k} \triangleq
+\left.\frac{\partial h(\bm{x})}{\partial \bm{x}}\right|_{\bm{x}=\hat{\bm{x}}_{k|k-1}}.
+\label{eq:jacobians_general}
+\end{equation}
+
+\textbf{Prediction.}
+\begin{subequations}\label{eq:ekf_pred_general}
+\begin{align}
+\hat{\bm{x}}_{k|k-1} &= f(\hat{\bm{x}}_{k-1|k-1}), \label{eq:ekf_pred_mean}\\
+\bm{\Sigma}_{k|k-1} &= \bm{J}^f_{k-1}\bm{\Sigma}_{k-1|k-1}(\bm{J}^f_{k-1})\T + \bm{Q}. \label{eq:ekf_pred_cov}
+\end{align}
+\end{subequations}
+
+\textbf{Update.}
+Define
+$\hat{\bm{y}}_{k|k-1}=h(\hat{\bm{x}}_{k|k-1})$ and
+$\Delta\bm{y}_k=\bm{y}_k-\hat{\bm{y}}_{k|k-1}$.
+Then
+\begin{subequations}\label{eq:ekf_upd_general}
+\begin{align}
+\bm{S}_k &= \bm{J}^h_{k}\bm{\Sigma}_{k|k-1}(\bm{J}^h_{k})\T + \bm{R}, \label{eq:S_general}\\
+\bm{K}_k &= \bm{\Sigma}_{k|k-1}(\bm{J}^h_{k})\T \bm{S}_k\inv, \label{eq:K_general}\\
+\hat{\bm{x}}_{k|k} &= \hat{\bm{x}}_{k|k-1} + \bm{K}_k\Delta\bm{y}_k. \label{eq:x_upd_general}
+\end{align}
+\end{subequations}
+For numerical stability, we use the Joseph-form covariance update:
+\begin{equation}
+\bm{\Sigma}_{k|k}=
+(\bm{I}-\bm{K}_k\bm{J}^h_{k})\bm{\Sigma}_{k|k-1}(\bm{I}-\bm{K}_k\bm{J}^h_{k})\T
++\bm{K}_k\bm{R}\bm{K}_k\T.
+\label{eq:joseph_general}
+\end{equation}
+
+% =====================================================================
+\section{Proposed Approach}
+% =====================================================================
+We assume the measurement model is reliable, while the transition model used by the filter is only \emph{nominal} and may be mismatched.
+We preserve the analytic EKF update \eqref{eq:ekf_upd_general} and learn prediction-side corrections from unlabeled measurements.
+
+\subsection{Nominal EKF Prior}
+Let $f_{\mathrm{nom}}$ denote the nominal transition used by the filter.
+Given $(\hat{\bm{x}}_{k-1|k-1},\bm{\Sigma}_{k-1|k-1})$, define
+\begin{equation}
+\bm{J}^{f,\mathrm{nom}}_{k-1} \triangleq
+\left.\frac{\partial f_{\mathrm{nom}}(\bm{x})}{\partial \bm{x}}\right|_{\bm{x}=\hat{\bm{x}}_{k-1|k-1}}.
+\end{equation}
+The nominal EKF prior is
+\begin{subequations}\label{eq:nom_prior}
+\begin{align}
+\hat{\bm{x}}^{\mathrm{nom}}_{k|k-1} &= f_{\mathrm{nom}}(\hat{\bm{x}}_{k-1|k-1}),\\
+\bm{\Sigma}^{\mathrm{nom}}_{k|k-1} &=
+\bm{J}^{f,\mathrm{nom}}_{k-1}\bm{\Sigma}_{k-1|k-1}(\bm{J}^{f,\mathrm{nom}}_{k-1})\T + \bm{Q}_0,
+\end{align}
+\end{subequations}
+where $\bm{Q}_0$ is a fixed nominal process covariance (estimated by warm-start; see Sec.~\ref{subsec:warmstart}).
+
+\subsection{GRU-Augmented Prediction}
+We augment the nominal prior mean and covariance using a GRU.
+Let $\bm{z}_k$ be the GRU hidden state.
+We form an input feature vector from the previous posterior and the previous innovation:
+\begin{equation}
+\bm{u}_k \triangleq
+\begin{bmatrix}
+\hat{\bm{x}}_{k-1|k-1}\\
+\Delta\bm{y}_{k-1}
+\end{bmatrix},
+\qquad
+\bm{z}_k = \mathrm{GRU}(\bm{z}_{k-1},\bm{u}_k).
+\label{eq:gru_feature}
+\end{equation}
+Two lightweight heads map $\bm{z}_k$ to (i) a bounded mean correction $\bm{\delta}_k$
+and (ii) a constrained diagonal scaling vector $\bm{\alpha}_k$:
+\begin{subequations}\label{eq:heads}
+\begin{align}
+\bm{\delta}_k &= c\,\tanh(\bm{W}_{\delta}\bm{z}_k+\bm{b}_{\delta}), \label{eq:delta}\\
+\bm{\alpha}_k &= \alpha_{\min}\bm{1} + (\alpha_{\max}-\alpha_{\min})
+\,\sigma(\bm{W}_{\alpha}\bm{z}_k+\bm{b}_{\alpha}), \label{eq:alpha}
+\end{align}
+\end{subequations}
+where $c>0$ controls the maximum correction magnitude and
+$\alpha_{\min}\le \alpha_{k,i}\le \alpha_{\max}$ enforces bounded scaling.
+
+Define $\bm{A}_k\triangleq\diag(\bm{\alpha}_k)$.
+The GRU-augmented prior is
+\begin{subequations}\label{eq:aug_prior}
+\begin{align}
+\hat{\bm{x}}_{k|k-1} &= \hat{\bm{x}}^{\mathrm{nom}}_{k|k-1} + \bm{\delta}_k, \label{eq:aug_x}\\
+\bm{\Sigma}_{k|k-1} &= \bm{A}_k \,\bm{\Sigma}^{\mathrm{nom}}_{k|k-1}\,\bm{A}_k. \label{eq:aug_Sigma}
+\end{align}
+\end{subequations}
+We then apply the standard EKF update \eqref{eq:ekf_upd_general} with this augmented prior,
+thereby retaining a closed-form Bayesian measurement update and explicit covariance recursion.
+
+\subsection{Warm-Start of the Process Covariance}
+\label{subsec:warmstart}
+
+Training is unsupervised and uses only measurement sequences.
+We estimate a nominal process covariance on a held-out warm-start subset
+$\mathbb{D}_{\mathrm{warm}}$ and keep it fixed during subsequent GRU training.
+
+We adopt an isotropic parameterization $\bm{Q}_0=q_0^2\bm{I}_{d_x}$.
+We select $q_0$ by minimizing the innovation negative log-likelihood on
+$\mathbb{D}_{\mathrm{warm}}$ using a short one-dimensional search.
+
+For a candidate $q_0$, we run a nominal EKF (without GRU augmentation) on
+$\mathbb{D}_{\mathrm{warm}}$ and compute the one-step predictive distribution
+$\bm{y}_k \mid \bm{Y}_{1:k-1} \approx \mathcal{N}(\hat{\bm{y}}_{k|k-1},\bm{S}_k)$,
+where $\Delta\bm{y}_k=\bm{y}_k-\hat{\bm{y}}_{k|k-1}$ and
+\begin{equation}
+\bm{S}_k = \bm{H}_k \bm{\Sigma}_{k|k-1}\bm{H}_k^\top + \bm{R}.
+\end{equation}
+Discarding constants, the per-step innovation NLL is
+\begin{equation}
+\ell_k(q_0)=
+\Delta\bm{y}_k^\top \bm{S}_k^{-1}\Delta\bm{y}_k
++\log\det(\bm{S}_k).
+\label{eq:warmstart-nll-step}
+\end{equation}
+We aggregate over the warm-start set
+\begin{equation}
+\mathcal{L}_{\mathrm{warm}}(q_0)
+\triangleq
+\frac{1}{N_{\mathrm{warm}}}\sum_{k\in\mathbb{D}_{\mathrm{warm}}}\ell_k(q_0),
+\label{eq:warmstart-nll}
+\end{equation}
+and select
+\begin{equation}
+q_0^\star \triangleq \arg\min_{q_0\in\mathcal{G}} \mathcal{L}_{\mathrm{warm}}(q_0),
+\qquad
+\bm{Q}_0 \leftarrow (q_0^\star)^2\bm{I}_{d_x},
+\label{eq:warmstart-select-nll}
+\end{equation}
+where $\mathcal{G}$ is a short log-spaced grid.
+All terms are computed via Cholesky factorization of $\bm{S}_k$ to avoid explicit
+matrix inversion and to obtain $\log\det(\bm{S}_k)$ stably.
+
+The resulting $\bm{Q}_0$ is then fixed for subsequent GRU-augmented training.
+
+
+\subsection{Unsupervised Training via Innovation Negative Log-Likelihood}
+Given a measurement sequence $\bm{Y}_{1:T}=\{\bm{y}_k\}_{k=1}^{T}$, the EKF defines a one-step predictive distribution
+\begin{equation}
+p(\bm{y}_k\mid \bm{Y}_{1:k-1})
+\approx \mathcal{N}\!\big(\hat{\bm{y}}_{k|k-1},\,\bm{S}_k\big),
+\label{eq:pred_dist}
+\end{equation}
+where $\hat{\bm{y}}_{k|k-1}=h(\hat{\bm{x}}_{k|k-1})$ and $\bm{S}_k$ is given by \eqref{eq:S_general}
+computed using the augmented prior \eqref{eq:aug_prior}.
+Applying the chain rule,
+\begin{equation}
+p(\bm{Y}_{1:T})=\prod_{k=1}^{T} p(\bm{y}_k\mid \bm{Y}_{1:k-1}),
+\end{equation}
+and taking negative log-likelihood yields (up to an additive constant independent of parameters):
+\begin{equation}
+\mathcal{L}_{\mathrm{NLL}}(\theta)
+=
+\frac{1}{T}\sum_{k=1}^{T}
+\left(
+\Delta\bm{y}_k\T \bm{S}_k\inv \Delta\bm{y}_k
++
+\log\det(\bm{S}_k)
+\right),
+\label{eq:nll}
+\end{equation}
+where $\theta$ denotes all trainable GRU and head parameters, and
+$\Delta\bm{y}_k=\bm{y}_k-\hat{\bm{y}}_{k|k-1}$.
+In practice, $\bm{S}_k\inv\Delta\bm{y}_k$ and $\log\det(\bm{S}_k)$ are computed via Cholesky factorization to avoid explicit matrix inversion.
+
+% =====================================================================
+\section{Experiments}
+% =====================================================================
+This section specifies the Exercise~5.5 scenario, the professor-provided range observation convention, and the evaluation protocol.
+All concrete model matrices, anchor geometry, and noise settings are defined here.
+
+\subsection{Scenario: Exercise~5.5 Constant-Velocity Model}
+We use the 2D constant-velocity state
+\begin{equation}
+\bm{x}_k \triangleq [x_k,\ y_k,\ \dot{x}_k,\ \dot{y}_k]\T \in \R^4.
+\label{eq:state_cv}
+\end{equation}
+With sampling period $\Delta t$, the nominal linear transition is
+\begin{equation}
+\bm{x}_k = \bm{F}\bm{x}_{k-1} + \bm{q}_{k-1},
+\qquad \bm{q}_{k-1}\sim\mathcal{N}(\bm{0},\bm{Q}),
+\label{eq:cv}
+\end{equation}
+with
+\begin{equation}
+\bm{F}=
+\begin{bmatrix}
+1 & 0 & \Delta t & 0\\
+0 & 1 & 0 & \Delta t\\
+0 & 0 & 1 & 0\\
+0 & 0 & 0 & 1
+\end{bmatrix}.
+\label{eq:F_cv}
+\end{equation}
+The process noise covariance follows the discretized Wiener velocity model:
+\begin{equation}
+\bm{Q}=
+\begin{bmatrix}
+q_1^c \frac{\Delta t^3}{3} & 0 & q_1^c \frac{\Delta t^2}{2} & 0\\
+0 & q_2^c \frac{\Delta t^3}{3} & 0 & q_2^c \frac{\Delta t^2}{2}\\
+q_1^c \frac{\Delta t^2}{2} & 0 & q_1^c \Delta t & 0\\
+0 & q_2^c \frac{\Delta t^2}{2} & 0 & q_2^c \Delta t
+\end{bmatrix}.
+\label{eq:Q_wiener_velocity}
+\end{equation}
+
+\subsection{Multi-Anchor Range-Only Measurements (Professor Convention)}
+Let $M$ anchors have known fixed 2D positions
+$\bm{s}^{(i)}=[s_x^{(i)},\,s_y^{(i)}]\T$, $i\in\{1,\dots,M\}$.
+At time $k$, anchor $i$ produces one scalar range measurement using the professor's ``plus'' convention:
+\begin{equation}
+\theta_k^{(i)} =
+\sqrt{\big(s_x^{(i)} + x_k\big)^2 + \big(s_y^{(i)} + y_k\big)^2}
++ r_k^{(i)},
+\qquad
+r_k^{(i)}\sim\mathcal{N}(0,\sigma_{r,i}^2).
+\label{eq:prof_range}
+\end{equation}
+Stacking $\bm{y}_k=[\theta_k^{(1)},\ldots,\theta_k^{(M)}]\T$ yields
+\begin{equation}
+\bm{y}_k = \bm{h}(\bm{x}_k)+\bm{r}_k,
+\qquad
+\bm{r}_k\sim\mathcal{N}(\bm{0},\bm{R}),
+\quad
+\bm{R}=\diag(\sigma_{r,1}^2,\ldots,\sigma_{r,M}^2).
+\label{eq:y_stack}
+\end{equation}
+Here $\bm{h}(\bm{x}_k)=[h^{(1)}(\bm{x}_k),\ldots,h^{(M)}(\bm{x}_k)]\T$ and
+\begin{equation}
+h^{(i)}(\bm{x}_k)=
+\sqrt{\big(s_x^{(i)} + x_k\big)^2 + \big(s_y^{(i)} + y_k\big)^2}.
+\label{eq:h_i}
+\end{equation}
+
+\subsection{EKF Measurement Jacobian for the Professor Range Form}
+For anchor $i$, define
+\[
+\Delta x_k^{(i)} \triangleq s_x^{(i)} + \hat{x}_{k|k-1},\qquad
+\Delta y_k^{(i)} \triangleq s_y^{(i)} + \hat{y}_{k|k-1},
+\qquad
+d_k^{(i)} \triangleq \sqrt{(\Delta x_k^{(i)})^2+(\Delta y_k^{(i)})^2}.
+\]
+Clamping $d_k^{(i)}\leftarrow \max(d_k^{(i)},\varepsilon_d)$ avoids division by zero.
+Then the $i$-th Jacobian row (w.r.t.\ $\bm{x}_k=[x_k,y_k,\dot{x}_k,\dot{y}_k]\T$) is
+\begin{equation}
+\bm{H}_k^{(i)} =
+\begin{bmatrix}
+\frac{\Delta x_k^{(i)}}{d_k^{(i)}} &
+\frac{\Delta y_k^{(i)}}{d_k^{(i)}} &
+0 & 0
+\end{bmatrix}.
+\label{eq:H_row}
+\end{equation}
+Stacking rows gives $\bm{H}_k\in\R^{M\times 4}$ used in EKF/UKF linearization steps.
+
+\subsection{Data Generation and Motion-Model Mismatch (Exercise~5.5-Style Maneuvers)}
+We generate trajectories from \eqref{eq:cv}--\eqref{eq:Q_wiener_velocity} outside maneuver segments.
+To induce controlled mismatch while keeping the filter nominal constant-velocity, we inject turn segments by rotating the \emph{true} velocity vector:
+\begin{equation}
+\begin{bmatrix}
+\dot{x}_{k+1}\\ \dot{y}_{k+1}
+\end{bmatrix}
+=
+\begin{bmatrix}
+\cos(\omega \Delta t) & -\sin(\omega \Delta t)\\
+\sin(\omega \Delta t) & \cos(\omega \Delta t)
+\end{bmatrix}
+\begin{bmatrix}
+\dot{x}_{k}\\ \dot{y}_{k}
+\end{bmatrix},
+\label{eq:vel_rotate}
+\end{equation}
+followed by position integration.
+Outside these segments, the true dynamics follow \eqref{eq:cv}.
+We evaluate:
+\begin{itemize}
+\item \textbf{Matched:} $\omega=0$ for all $k$.
+\item \textbf{Mild mismatch:} $\omega=\omega_1$ on designated segments, $0$ otherwise.
+\item \textbf{Strong mismatch:} $\omega=\omega_2$ on the same segments, $0$ otherwise.
+\end{itemize}
+
+\subsection{Baselines}
+We compare four methods:
+\begin{itemize}
+\item \textbf{EKF (nominal):} EKF with nominal $(\bm{F},\bm{Q}_0)$ and range model \eqref{eq:prof_range}.
+\item \textbf{UKF (nominal):} UKF with the same nominal $(\bm{F},\bm{Q}_0)$ and $\bm{R}$.
+\item \textbf{PF (bootstrap):} particle filter with transition \eqref{eq:cv} and Gaussian process noise, and importance weights from the Gaussian likelihood implied by \eqref{eq:y_stack}.
+\item \textbf{GRU-augmented EKF (ours, NLL-only):} Sec.~III with warm-started $\bm{Q}_0$ and training loss \eqref{eq:nll}.
+\end{itemize}
+
+\subsection{Training Protocol}
+Training uses only measurement sequences $\{\bm{y}_k\}$.
+We optimize $\theta$ by minimizing \eqref{eq:nll} with truncated backpropagation through time (TBPTT) over short windows.
+Warm-start estimation of $\bm{Q}_0$ is performed once on a held-out warm-start subset, and then $\bm{Q}_0$ is fixed.
+
+\subsection{Metrics}
+We report position RMSE over $N$ test trajectories of length $T$:
+\begin{equation}
+\mathrm{RMSE}_{\mathrm{pos}}
+=
+\sqrt{
+\frac{1}{NT}\sum_{n=1}^{N}\sum_{k=1}^{T}
+\left\|
+\bm{p}^{(n)}_k - \hat{\bm{p}}^{(n)}_{k|k}
+\right\|_2^2
+},
+\qquad \bm{p}_k=[x_k,y_k]\T.
+\label{eq:rmse_pos}
+\end{equation}
+We additionally report the mean innovation NLL on the test set, computed from \eqref{eq:nll}.
+Optionally, we monitor the mean NIS,
+$\mathrm{NIS}_k=\Delta\bm{y}_k\T\bm{S}_k\inv\Delta\bm{y}_k$,
+as a diagnostic of innovation-level scale calibration.
+
+% =====================================================================
+\section{Conclusion}
+% =====================================================================
+We presented an unsupervised GRU-augmented EKF for multi-anchor range-only tracking that preserves the analytic EKF measurement update and learns prediction-side corrections using innovation likelihood only.
+By combining residual mean correction and diagonal covariance scaling within the EKF prior, the proposed method improves robustness under controlled maneuver-induced mismatch, while retaining explicit covariance outputs.
+Experiments on the Exercise~5.5 range-only scenario compare EKF, UKF, PF, and the proposed NLL-trained GRU-augmented EKF.
+
+% =====================================================================
+% References
+% =====================================================================
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}

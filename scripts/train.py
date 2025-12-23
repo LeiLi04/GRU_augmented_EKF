@@ -1,4 +1,4 @@
-"""Run NLL-only training for the GRU-augmented EKF."""
+"""Run NLL-only training for the GRU-augmented EKF (range-only dataset)."""
 from __future__ import annotations
 
 import argparse
@@ -13,24 +13,26 @@ from torch.utils.tensorboard import SummaryWriter
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.append(str(SRC_ROOT))
+if str(SRC_ROOT) in sys.path:
+    sys.path.remove(str(SRC_ROOT))
+sys.path.insert(0, str(SRC_ROOT))
 
-from gru_augmented_ekf.config import ExperimentConfig, load_config  # noqa: E402
-from gru_augmented_ekf.data.lorenz import (  # noqa: E402
+from config import ExperimentConfig, load_config  # noqa: E402
+from data import (  # noqa: E402
     MeasurementDataset,
     collate_padded_observations,
     windowed_dataset,
 )
-from gru_augmented_ekf.data.splits import (  # noqa: E402
+from data.splits import (  # noqa: E402
     create_splits_file_name,
     load_splits_file,
     obtain_tr_val_test_idx,
+    obtain_tr_val_test_warm_idx,
     save_splits_file,
 )
-from gru_augmented_ekf.train.trainer import Trainer, build_model_components, evaluate_nll  # noqa: E402
-from gru_augmented_ekf.train.warmstart_q0 import covariance_matching_warm_start  # noqa: E402
-from gru_augmented_ekf.utils.seed import seed_everything  # noqa: E402
+from train.trainer import Trainer, build_model_components, evaluate_nll  # noqa: E402
+from train.warmstart_q0 import covariance_matching_warm_start  # noqa: E402
+from utils.seed import seed_everything  # noqa: E402
 
 
 def compute_observation_statistics(dataset, indices, obs_dim: int):
@@ -52,7 +54,7 @@ def compute_observation_statistics(dataset, indices, obs_dim: int):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train GRU-augmented EKF with innovation NLL.")
+    parser = argparse.ArgumentParser(description="Train GRU-augmented EKF with innovation NLL (range dataset).")
     parser.add_argument(
         "--config",
         type=str,
@@ -62,12 +64,17 @@ def main() -> None:
     parser.add_argument("--device", type=str, default=None, help="Optional device override.")
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
+    cfg_path = Path(args.config).resolve()
+    cfg = load_config(cfg_path)
     if args.device:
         cfg.device = args.device
 
     seed_everything(cfg.seed, cfg.deterministic)
-    device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+
+    device_str = cfg.device
+    if device_str.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but torch.cuda.is_available() is False. Check your GPU/PyTorch installation.")
+    device = torch.device(device_str)
 
     train_path = Path(cfg.data.train_path).resolve()
     dataset = MeasurementDataset(train_path)
@@ -81,29 +88,31 @@ def main() -> None:
     if splits_path.exists():
         splits = load_splits_file(splits_path)
         train_idx, val_idx, test_idx = splits["train"], splits["val"], splits["test"]
+        warm_idx = splits.get("warm")
     else:
-        train_idx, val_idx, test_idx = obtain_tr_val_test_idx(
+        train_idx, val_idx, test_idx, warm_idx = obtain_tr_val_test_warm_idx(
             dataset,
             cfg.data.tr_to_test_split,
             cfg.data.tr_to_val_split,
+            cfg.data.warm_fraction,
             cfg.seed,
         )
-        save_splits_file(splits_path, {"train": train_idx, "val": val_idx, "test": test_idx})
+        save_payload = {"train": train_idx, "val": val_idx, "test": test_idx, "warm": warm_idx}
+        save_splits_file(splits_path, save_payload)
 
     train_subset = Subset(dataset, train_idx)
     val_subset = Subset(dataset, val_idx)
     test_subset = Subset(dataset, test_idx)
-
-    _, obs_variance = compute_observation_statistics(dataset, train_idx, cfg.model.obs_dim)
-    obs_variance = obs_variance.to(dtype=torch.float32)
+    warm_subset = Subset(dataset, warm_idx) if warm_idx is not None else None
 
     warm_split = cfg.train.warmup_split.lower() if cfg.train.warmup_split else "val"
-    if warm_split == "test":
-        warm_subset = test_subset
-    elif warm_split == "train":
-        warm_subset = train_subset
-    else:
-        warm_subset = val_subset
+    if warm_subset is None:
+        if warm_split == "test":
+            warm_subset = test_subset
+        elif warm_split == "train":
+            warm_subset = train_subset
+        else:
+            warm_subset = val_subset
 
     warm_start_loader = DataLoader(
         warm_subset,
@@ -132,15 +141,15 @@ def main() -> None:
         collate_fn=collate,
     )
 
-    dynamics, ekf, q_init, r_init = build_model_components(cfg, device, train_path=train_path, obs_variance=obs_variance)
+    dynamics, ekf, q_init, r_init = build_model_components(cfg, device, train_path=train_path, obs_variance=None)
 
     if cfg.train.use_warmup_q:
         for p in ekf.q_param.parameters():
             p.requires_grad_(True)
-        tau_q = covariance_matching_warm_start(ekf, warm_start_loader, device=device)
+        q0_star = covariance_matching_warm_start(ekf, warm_start_loader, device=device)
         for p in ekf.q_param.parameters():
             p.requires_grad_(cfg.model.train_q)
-        print(f"[warm start] tau_q={tau_q:.4f}")
+        print(f"[warm start] q0*={q0_star:.6f}")
 
     params = list(dynamics.parameters())
     if cfg.model.train_q:
@@ -148,7 +157,15 @@ def main() -> None:
     if cfg.model.train_r:
         params += list(ekf.r_param.parameters())
     optimizer = torch.optim.Adam(params, lr=cfg.train.lr, betas=cfg.train.betas)
-    scaler = torch.amp.GradScaler("cuda") if cfg.train.amp and device.type == "cuda" else None
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=3,
+        threshold=cfg.earlystop.min_delta,
+        verbose=True,
+    )
+    scaler = torch.cuda.amp.GradScaler() if cfg.train.amp and device.type == "cuda" else None
     trainer = Trainer(dynamics, ekf, optimizer, cfg, device, scaler=scaler)
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -180,6 +197,8 @@ def main() -> None:
         f"dataset        : {train_path.stem}",
         f"train_path     : {cfg.data.train_path}",
         f"device         : {device}",
+        f"torch_version  : {torch.__version__}",
+        f"cuda_available : {torch.cuda.is_available()}",
         "---------------- Model ----------------",
         f"n_states       : {cfg.model.state_dim}",
         f"n_obs          : {cfg.model.obs_dim}",
@@ -198,60 +217,46 @@ def main() -> None:
     patience = int(cfg.earlystop.patience)
     min_delta = float(cfg.earlystop.min_delta)
 
-    writer: SummaryWriter | None = SummaryWriter(log_dir=str(tensorboard_dir)) if cfg.logging.tensorboard else None
-    try:
-        for _ in range(cfg.train.epochs):
-            epoch_start = time.time()
-            metrics = trainer.train_epoch(train_loader, writer=writer)
-            val_innov = evaluate_nll(ekf, dynamics, val_loader, cfg, device)
-            elapsed = time.time() - epoch_start
-            line = (
-                f"Epoch {trainer.state.epoch}/{cfg.train.epochs} "
-                f"Train NLL:{metrics['L_innov']:.6f} "
-                f"Val NLL:{val_innov:.6f} "
-                f"nis_mean:{metrics['nis_mean']:.6f} "
-                f"time:{elapsed:.2f}s"
+    for epoch in range(cfg.train.epochs):
+        metrics = trainer.train_epoch(train_loader)
+        val_loss = evaluate_nll(trainer.ekf, trainer.dynamics, val_loader, cfg, device)
+        scheduler.step(val_loss)
+        if val_loss < best_val - min_delta:
+            best_val = val_loss
+            epochs_no_improve = 0
+            trainer.save(best_model_path)
+        else:
+            epochs_no_improve += 1
+        trainer.save(checkpoint_path)
+
+        with log_file_path.open("a") as log_file:
+            log_file.write(
+                f"epoch {epoch:04d} | train_nll {metrics['L_innov']:.6f} "
+                f"| val_nll {val_loss:.6f} | nis {metrics['nis_mean']:.6f}\n"
             )
-            print(line)
-            with log_file_path.open("a") as log_file:
-                log_file.write(line + "\n")
-            if writer is not None:
-                writer.add_scalar("val/L_innov", val_innov, trainer.state.epoch)
-
-            if val_innov < best_val - min_delta:
-                best_val = val_innov
-                epochs_no_improve = 0
-                torch.save(
-                    {
-                        "dynamics": dynamics.state_dict(),
-                        "q_param": ekf.q_param.state_dict(),
-                        "r_param": ekf.r_param.state_dict(),
-                        "metrics": {**metrics, "val_innov": val_innov},
-                    },
-                    best_model_path,
-                )
-            else:
-                epochs_no_improve += 1
-
-            if patience > 0 and epochs_no_improve >= patience:
-                print(f"Early stopping at epoch {trainer.state.epoch} (patience={patience})")
-                break
-
-        torch.save(
-            {
-                "dynamics": dynamics.state_dict(),
-                "q_param": ekf.q_param.state_dict(),
-                "r_param": ekf.r_param.state_dict(),
-                "metrics": {"best_val_innov": best_val},
-            },
-            checkpoint_path,
-        )
-        print(f"Saved last checkpoint to {checkpoint_path}")
-        print(f"Best validation innovation NLL: {best_val:.6f}")
-    finally:
-        if writer is not None:
-            writer.flush()
+        if cfg.logging.tensorboard:
+            writer = SummaryWriter(log_dir=tensorboard_dir)
+            writer.add_scalar("train/L_innov", metrics["L_innov"], epoch)
+            writer.add_scalar("val/L_innov", val_loss, epoch)
+            writer.add_scalar("train/nis", metrics["nis_mean"], epoch)
             writer.close()
+
+        if patience > 0 and epochs_no_improve >= patience:
+            print(f"Early stopping at epoch {epoch}")
+            break
+
+    # Final eval on val/test
+    final_val = evaluate_nll(trainer.ekf, trainer.dynamics, val_loader, cfg, device)
+    final_test = evaluate_nll(
+        trainer.ekf,
+        trainer.dynamics,
+        DataLoader(test_subset, batch_size=cfg.data.batch_size, collate_fn=collate),
+        cfg,
+        device,
+    )
+    with log_file_path.open("a") as log_file:
+        log_file.write(f"final_val_nll {final_val:.6f} | final_test_nll {final_test:.6f}\n")
+    print(f"Training complete. Best val {best_val:.6f}, final val {final_val:.6f}, test {final_test:.6f}")
 
 
 if __name__ == "__main__":

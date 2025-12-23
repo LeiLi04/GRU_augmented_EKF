@@ -1,0 +1,117 @@
+\begin{figure*}[!t]
+\centering
+% Layers (keep local to this figure)
+\pgfdeclarelayer{foreground}
+\pgfsetlayers{background,main,foreground}
+
+\begin{tikzpicture}[
+  node distance=8mm and 14mm,
+  >=Latex,
+  font=\footnotesize,
+  box/.style={draw, rounded corners, thick, align=center, fill=white, inner sep=5pt},
+  eqnbox/.style={box, text width=6cm, font=\scriptsize},
+  loss/.style={box, fill=gray!15, text width=4.2cm, font=\scriptsize},
+  param/.style={box, dashed, text width=3.4cm, font=\scriptsize},
+  line/.style={-Latex, thick},
+  connector/.style={thick, rounded corners=3mm}
+]
+
+% ============================================================
+% 1) Residual Adapter (GRU + heads)
+% ============================================================
+\node[box, fill=gray!10, text width=9cm, inner sep=8pt] (gen) {
+  \textbf{Residual Adapter (GRU + Heads)}\\[2pt]
+  Input: $(\hat{\bm{x}}_{t-1|t-1},\,\Delta\bm{y}_{t-1})$, hidden $\bm{h}_{t-1}$\\
+  Mean residual: $\bm{\delta}_t = \tanh(\mathrm{FC}_\delta(\bm{h}_{t-1}))$\\
+  Diagonal scale: $\bm{\alpha}_t = \alpha_{\min}\!+\!(\alpha_{\max}\!-\!\alpha_{\min})\,\sigma(\mathrm{FC}_\alpha(\bm{h}_{t-1}))$\\
+  Low-rank factor: $\bm{L}_t = c_L\,\tanh(\mathrm{FC}_{\mathrm{cov}}(\bm{h}_{t-1}))$, shape $[B,d_x,r]$
+};
+\node[anchor=north west, font=\bfseries, inner sep=4pt, xshift=2pt, yshift=-2pt]
+  at (gen.north west) {Generator};
+
+% ============================================================
+% 2) EKF core
+% ============================================================
+\node[eqnbox, below=8mm of gen] (predict) {
+  \textbf{Predict}\\[2pt]
+  $\hat{\bm{x}}_{t|t-1} = f_{\mathrm{known}}(\hat{\bm{x}}_{t-1|t-1}) + \bm{\delta}_t$\\[3pt]
+  $\bm{\Sigma}^{\mathrm{phys}}_{t|t-1} =
+    \bm{J}^{f,\mathrm{phys}}_{t-1}\bm{\Sigma}_{t-1|t-1}(\bm{J}^{f,\mathrm{phys}}_{t-1})^\top + \bm{Q}_0$\\[3pt]
+  $\bm{\Sigma}_{t|t-1} =
+    \bm{A}_t\,\bm{\Sigma}^{\mathrm{phys}}_{t|t-1}\,\bm{A}_t
+    + \bm{L}_t \bm{L}_t^\top,\quad \bm{A}_t=\diag(\bm{\alpha}_t)$
+};
+
+\node[eqnbox, below=8mm of predict] (observe) {
+  \textbf{Observation}\\[2pt]
+  $\hat{\bm{y}}_{t|t-1}= \bm{h}(\hat{\bm{x}}_{t|t-1})$\\[2pt]
+  $\bm{S}_{t|t-1}
+    =\bm{H}_t\,\bm{\Sigma}_{t|t-1}\,\bm{H}_t^{\top} + \bm{R}$
+};
+
+\node[eqnbox, below=8mm of observe] (update) {
+  \textbf{Update (Joseph)}\\[2pt]
+  $\Delta \bm{y}_t = \bm{y}_t-\hat{\bm{y}}_{t|t-1}$\\[1pt]
+  $\bm{K}_t =\bm{\Sigma}_{t|t-1}\bm{H}_t^{\top}\bm{S}_{t|t-1}^{-1}$\\[2pt]
+  $\hat{\bm{x}}_{t|t}=\hat{\bm{x}}_{t|t-1}+\bm{K}_t\Delta\bm{y}_t$\\[2pt]
+  $\bm{\Sigma}_{t|t}=(\bm{I}-\bm{K}_t\bm{H}_t)\bm{\Sigma}_{t|t-1}(\bm{I}-\bm{K}_t\bm{H}_t)^{\top}
+     +\bm{K}_t\bm{R}\bm{K}_t^{\top}$
+};
+
+\draw[line] (gen.south) -- (predict.north);
+\draw[line] (predict.south) -- (observe.north);
+\draw[line] (observe.south) -- (update.north);
+
+% ============================================================
+% 3) Inputs & losses
+% ============================================================
+\node[box, left=12mm of update, text width=2.8cm] (realY) {
+  \textbf{Input}\\[1pt]
+  Sequence $\bm{Y}_{1:T}$
+};
+\draw[line] (realY.east) -- node[above, font=\tiny, xshift=-2pt]{$\bm{y}_t$} (update.west);
+
+\node[loss, below=6mm of realY] (innov) {
+  \textbf{Innovation NLL}\\[2pt]
+  $\frac{1}{T}\sum_t\big(
+     \Delta\bm{y}_t^{\top}\bm{S}_{t|t-1}^{-1}\Delta\bm{y}_t
+     +\log|\bm{S}_{t|t-1}|
+   \big)$
+};
+\draw[connector] (update.south) |- (innov.east);
+
+\node[loss, right=14mm of innov, text width=4.0cm] (reg) {
+  \textbf{Regularizers}\\[2pt]
+  $\lambda_{\delta}\|\bm{\delta}\|_2^2
+   + \lambda_{L}\|\bm{L}\|_F^2$
+};
+
+\node[box, fill=gray!25, below=14mm of observe, text width=8.5cm] (total) {
+  \textbf{Total Loss}\\[2pt]
+  $\mathcal{L} = \lambda_{\mathrm{innov}}\,\mathcal{L}_{\mathrm{innov}}
+   + \lambda_{\delta}\|\bm{\delta}\|_2^2
+   + \lambda_{L}\|\bm{L}\|_F^2$
+};
+
+\begin{pgfonlayer}{background}
+  \draw[connector] (innov.south) -- ++(0,-0.8)
+    -| ($(total.north west)!0.25!(total.north east)$);
+  \draw[connector] (reg.south) -- ++(0,-0.8)
+    -| ($(total.north west)!0.75!(total.north east)$);
+\end{pgfonlayer}
+
+% Params
+\coordinate (paramsCenter) at ($(total.south west)!0.5!(total.south east)$);
+\node[param, below=6mm of paramsCenter, anchor=north] (pTheta)
+  {GRU + heads params $\theta$};
+\draw[line, dashed, gray] (total.south) -- ++(0,-0.2) -| (pTheta.north);
+
+\end{tikzpicture}
+
+\caption{GRU-augmented EKF (this work). The GRU adapter produces a bounded mean residual
+$\bm{\delta}_t$, diagonal scaling $\bm{\alpha}_t$ (via $\bm{A}_t=\diag(\bm{\alpha}_t)$), and a
+tanh-limited low-rank factor $\bm{L}_t$; prior covariance is updated as
+$\bm{A}_t\,\bm{\Sigma}^{\mathrm{phys}}_{t|t-1}\,\bm{A}_t + \bm{L}_t\bm{L}_t^\top$ (scheme B), ensuring PSD.
+Training minimizes innovation NLL plus small $\ell_2$/Frobenius regularizers on $\bm{\delta}$ and $\bm{L}$.}
+\label{fig:gru_augmented_ekf_arch}
+\end{figure*}

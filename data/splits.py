@@ -1,4 +1,4 @@
-"""Train/val/test/warm split utilities for range datasets."""
+"""Train/val/test split utilities."""
 from __future__ import annotations
 
 import pickle
@@ -74,7 +74,6 @@ def save_splits_file(path: Path, splits: dict) -> None:
 
 __all__ = [
     "obtain_tr_val_test_idx",
-    "obtain_tr_val_test_warm_idx",
     "create_splits_file_name",
     "load_splits_file",
     "save_splits_file",

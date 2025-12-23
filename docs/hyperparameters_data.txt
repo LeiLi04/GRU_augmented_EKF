@@ -1,0 +1,70 @@
+% ============================================================
+% 数据集生成器超参数规格说明 (Dataset Generator Hyperparameters)
+% ============================================================
+
+\section{数据集生成器超参数规格说明}
+
+本文档整理了“数据集生成器”中起到“超参数”作用的关键项，并说明了其对数据生成及后续训练的影响。
+
+\subsection{1. 随机性与可复现}
+\begin{itemize}
+    \item \textbf{随机种子 (Random Seed):} $123$
+    \item \textbf{作用:} 保证每次生成的 20 条轨迹完全一致，用于对比实验和复现实验结果。
+\end{itemize}
+
+\subsection{2. 时间离散与序列长度}
+\begin{itemize}
+    \item \textbf{采样周期:} $\Delta t = 0.01$
+    \item \textbf{作用:} 决定状态转移矩阵 $\bm{F}$ 和过程噪声协方差 $\bm{Q}$ 的离散化尺度。$\Delta t$ 越小，单步变化越小。
+    \item \textbf{每条轨迹步数:} $steps = 500$（对应总时长为 5 秒）。
+\end{itemize}
+
+\subsection{3. 数据规模与划分}
+\begin{itemize}
+    \item \textbf{轨迹总数:} $N_{total} = 20$
+    \item \textbf{数据集划分:} 训练集 15 条，验证集 3 条，测试集 2 条。
+    \item \textbf{重要性:} 决定模型是否能在“全新轨迹”上实现泛化。
+\end{itemize}
+
+\subsection{4. TBPTT 流式训练配置}
+\begin{itemize}
+    \item \textbf{窗口长度 ($L$):} $50$（对应 0.5 秒）。
+    \item \textbf{步幅 (Stride):} $50$（非重叠分块）。
+    \item \textbf{分块逻辑:} 每条轨迹切分为 10 个连续块。第 $j$ 块覆盖 $t \in [(j-1) \cdot 50, j \cdot 50 - 1]$（基于 0 的索引）。
+    \item \textbf{影响:} 影响训练的“记忆长度”和梯度回传范围。
+\end{itemize}
+
+\subsection{5. 过程模型超参数}
+\begin{itemize}
+    \item \textbf{过程噪声强度:} $q^c = 0.1$。
+    \item \textbf{过程噪声协方差 $\bm{Q}$:} 在 $\Delta t = 0.01, q^c = 0.1$ 设定下，其数值量级约为：
+    \begin{equation}
+    \bm{Q} \approx
+    \begin{bmatrix}
+    3.33 \times 10^{-8} & 0 & 5.00 \times 10^{-6} & 0 \\
+    0 & 3.33 \times 10^{-8} & 0 & 5.00 \times 10^{-6} \\
+    5.00 \times 10^{-6} & 0 & 1.00 \times 10^{-3} & 0 \\
+    0 & 5.00 \times 10^{-6} & 0 & 1.00 \times 10^{-3}
+    \end{bmatrix}
+    \end{equation}
+    \item \textbf{数值稳定抖动 (Jitter):} $10^{-12}$，用于保证 Cholesky 分解的可行性。
+\end{itemize}
+
+\subsection{6. 观测模型超参数}
+\begin{itemize}
+    \item \textbf{测距噪声标准差:} $\sigma_r = 0.1$。决定了测量值的中观测噪声的量级。
+    \item \textbf{锚点布局 ($S_1 \dots S_4$):} 结构性超参数，显著影响可观测性与定位精度。
+    \item \textbf{观测方程 (教授惯例):} 
+    \begin{equation}
+    h^{(i)}(\bm{x}_k) = \sqrt{(s_x^{(i)} + x_k)^2 + (s_y^{(i)} + y_k)^2}
+    \end{equation}
+\end{itemize}
+
+\subsection{7. 初始状态分布}
+\begin{itemize}
+    \item \textbf{初始位置:} $p_{x,0}, p_{y,0} \sim \mathcal{U}(-0.5, 0.5)$。
+    \item \textbf{初始速度:} $v_{x,0} \sim \mathcal{U}(0.5, 1.5)$, $v_{y,0} \sim \mathcal{U}(-0.5, 0.5)$。
+\end{itemize}
+
+\section*{核心关注点}
+在实际调参中，应优先关注：\textbf{1. $q^c$ (机动性), 2. $\sigma_r$ (观测噪声), 3. 初始速度范围 (泛化性)}。

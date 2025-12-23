@@ -5,7 +5,7 @@ from typing import Optional
 
 import torch
 
-from ..utils.masking import masked_mean
+from utils.masking import masked_mean
 
 
 def nmse(pred: torch.Tensor, target: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:

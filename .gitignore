@@ -25,3 +25,26 @@ log/
 models/
 outputs/
 *.pt
+
+# Data and generated artifacts
+data/**/*.npz
+data/**/*.pkl
+data/**/*.npy
+results/
+# figures/*.png
+# figures/*.pdf
+*.ckpt
+
+# Notebooks/checkpoints
+.ipynb_checkpoints/
+
+# LaTeX build
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.toc
+*.synctex.gz
