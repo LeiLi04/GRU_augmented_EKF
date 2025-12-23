@@ -1,0 +1,54 @@
+experiment:
+  seed: 42
+  device: cuda
+  deterministic: false
+  data:
+    train_path: ../src/data/trajectories/trajectories_m_3_n_3_LorenzSSM_data_T_100_N_1000_r2_-10.0dB_q2_0.0dB.pkl
+    test_path: ../src/data/trajectories/trajectories_m_3_n_3_LorenzSSM_data_T_2000_N_100_r2_-10.0dB_q2_0.0dB.pkl
+    long_test_path: ../src/data/trajectories/trajectories_m_3_n_3_LorenzSSM_data_T_2000_N_100_r2_-10.0dB_q2_0.0dB.pkl
+    split_path: ""
+    splits_name: ""
+    batch_size: 64
+    num_workers: 4
+    pin_memory: true
+    shuffle: true
+    window_length: 50
+    tr_to_test_split: 0.9
+    tr_to_val_split: 0.8333
+  model:
+    state_dim: 3
+    obs_dim: 3
+    dt: 0.02
+    dynamics_hidden: 128
+    dynamics_depth: 3
+    dynamics_use_gru: true
+    dynamics_tanh_scale: 0.1
+    dynamics_residual_init_std: 0.001
+    dynamics_scale_a_min: 0.95
+    dynamics_scale_a_max: 10.0
+    max_delta: null
+    q_init: 0.05
+    r_init: 0.1
+    train_q: false
+    train_r: false
+  train:
+    epochs: 200
+    tbptt_steps: 50
+    lr: 0.001
+    betas: [0.9, 0.999]
+    clip_norm: 1.0
+    amp: false
+    sigma0_scale: 1.0
+    use_warmup_q: false
+    warmup_split: val
+  earlystop:
+    patience: 15
+    min_delta: 0.0001
+  logging:
+    run_name: gru_augmented_ekf
+    log_dir: runs/gru_augmented_ekf
+    tensorboard: true
+    log_file_dir: log/gru_augmented_ekf
+    model_dir: models/gru_augmented_ekf
+    best_model_path: ""
+    checkpoint_path: ""
